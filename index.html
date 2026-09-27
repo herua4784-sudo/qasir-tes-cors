@@ -58,7 +58,7 @@
     // 4. Tempel URL itu di bawah ini, lalu deploy ulang Index.html ke GitHub Pages
     const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbykq9jikOTBR5z6whSZg_p8u6Gq8GW0j0Obz0zWq_UE0HKKqrdUB3fU9YlpOXymvQxB/exec';
 
-    const runGoogleScript = (functionName, ...args) => {
+    const runGoogleScriptRaw = (functionName, ...args) => {
       // Dijalankan DARI DALAM Google Apps Script (dibuka lewat script.google.com) —
       // tetap pakai google.script.run seperti sebelumnya, tidak ada yang berubah
       // dari cara kerja aplikasi selama ini.
@@ -97,6 +97,77 @@
             throw new Error(result.__error);
           }
           return result;
+        });
+    };
+
+    // ==========================================
+    // CACHE OFFLINE (IndexedDB): data penting (produk, harga, kategori, cabang)
+    // disimpan PERMANEN di HP setiap kali berhasil dimuat saat online. Kalau
+    // internet putus, aplikasi otomatis pakai data tersimpan terakhir ini, supaya
+    // kasir tetap bisa lihat-lihat produk & harga walau tidak ada koneksi.
+    // SENGAJA dibatasi ke data yang jarang berubah & bukan aksi/transaksi — bukan
+    // untuk data transaksi (itu harus selalu real-time, tidak boleh "nyangkut" versi lama).
+    // ==========================================
+    const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients'];
+    const OFFLINE_DB_NAME = 'qasir_offline_cache';
+    const OFFLINE_STORE_NAME = 'kv';
+
+    function openOfflineDb() {
+      return new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) { reject('IndexedDB tidak didukung di browser ini'); return; }
+        const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          if (!req.result.objectStoreNames.contains(OFFLINE_STORE_NAME)) {
+            req.result.createObjectStore(OFFLINE_STORE_NAME);
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function offlineCacheGet(key) {
+      return openOfflineDb().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction(OFFLINE_STORE_NAME, 'readonly');
+        const req = tx.objectStore(OFFLINE_STORE_NAME).get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      })).catch(() => undefined);
+    }
+
+    function offlineCacheSet(key, value) {
+      return openOfflineDb().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction(OFFLINE_STORE_NAME, 'readwrite');
+        const req = tx.objectStore(OFFLINE_STORE_NAME).put(value, key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      })).catch(() => {}); // gagal simpan cache bukan error fatal, diamkan saja
+    }
+
+    // Versi yang BENAR-BENAR dipakai di seluruh aplikasi (semua pemanggilan
+    // runGoogleScript(...) yang sudah ada otomatis lewat sini, tidak perlu diubah
+    // satu-satu di tempat lain).
+    const runGoogleScript = (functionName, ...args) => {
+      const isCacheable = OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1;
+      const cacheKey = functionName + ':' + JSON.stringify(args);
+
+      const callPromise = runGoogleScriptRaw(functionName, ...args);
+
+      if (!isCacheable) return callPromise;
+
+      return callPromise
+        .then((result) => {
+          offlineCacheSet(cacheKey, result); // simpan diam-diam, tidak perlu ditunggu
+          return result;
+        })
+        .catch((err) => {
+          return offlineCacheGet(cacheKey).then((cached) => {
+            if (cached !== undefined) {
+              console.warn('[Offline] Menampilkan data tersimpan untuk', functionName);
+              return cached;
+            }
+            throw err; // tidak ada data tersimpan sama sekali, lempar error asli
+          });
         });
     };
 
@@ -910,6 +981,7 @@
       if (!user) {
         return (
           <NotificationContext.Provider value={notificationAPI}>
+            <OfflineIndicator />
             <LoginScreen onLogin={handleLoginSuccess} />
             <CustomNotificationModal config={alertConfig} onClose={closeAlert} />
           </NotificationContext.Provider>
@@ -918,6 +990,7 @@
 
       return (
         <NotificationContext.Provider value={notificationAPI}>
+          <OfflineIndicator />
           <div className="min-h-screen">
             {user.role === 'Owner' ? (
               <OwnerDashboard user={user} branch={branch} onChangeBranch={handleChangeBranch} onLogout={handleLogout} settings={settings} onRefreshSettings={loadSettings} />
@@ -929,6 +1002,33 @@
             <CustomNotificationModal config={alertConfig} onClose={closeAlert} />
           </div>
         </NotificationContext.Provider>
+      );
+    }
+
+    // Pita kecil di paling atas layar, muncul otomatis begitu HP kehilangan koneksi
+    // internet -- supaya kasir sadar sedang lihat data tersimpan (bisa jadi tidak
+    // 100% terbaru), bukan data langsung dari server.
+    function OfflineIndicator() {
+      const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+      useEffect(() => {
+        const goOffline = () => setIsOffline(true);
+        const goOnline = () => setIsOffline(false);
+        window.addEventListener('offline', goOffline);
+        window.addEventListener('online', goOnline);
+        return () => {
+          window.removeEventListener('offline', goOffline);
+          window.removeEventListener('online', goOnline);
+        };
+      }, []);
+
+      if (!isOffline) return null;
+
+      return (
+        <div className="fixed top-0 left-0 right-0 z-[9999] bg-amber-500 text-white text-xs font-bold text-center py-1.5 shadow-md">
+          <i className="fa-solid fa-wifi-slash mr-1.5"></i>
+          Offline — menampilkan data tersimpan terakhir, mungkin tidak 100% terbaru
+        </div>
       );
     }
 
