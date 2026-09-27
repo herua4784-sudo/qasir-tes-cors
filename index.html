@@ -1243,7 +1243,9 @@
           }
         } catch (err) { 
           setError('Terjadi kesalahan koneksi.'); 
-          notify.alert("Gagal melakukan autentikasi. Hubungi pemilik sistem.", "Masalah Koneksi", "error");
+          // SEMENTARA: tampilkan pesan error ASLI (biasanya disamarkan demi kasir)
+          // supaya bisa didiagnosa dulu penyebab pastinya.
+          notify.alert("Detail teknis: " + (err && err.message ? err.message : String(err)), "Debug Sementara", "error");
         }
         setLoading(false);
       };
