@@ -111,14 +111,19 @@
     const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients'];
     const OFFLINE_DB_NAME = 'qasir_offline_cache';
     const OFFLINE_STORE_NAME = 'kv';
+    const QUEUE_STORE_NAME = 'pending_writes';
+    const OFFLINE_DB_VERSION = 2; // dinaikkan dari 1 -> 2 untuk menambah object store antrian
 
     function openOfflineDb() {
       return new Promise((resolve, reject) => {
         if (!('indexedDB' in window)) { reject('IndexedDB tidak didukung di browser ini'); return; }
-        const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+        const req = indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
         req.onupgradeneeded = () => {
           if (!req.result.objectStoreNames.contains(OFFLINE_STORE_NAME)) {
             req.result.createObjectStore(OFFLINE_STORE_NAME);
+          }
+          if (!req.result.objectStoreNames.contains(QUEUE_STORE_NAME)) {
+            req.result.createObjectStore(QUEUE_STORE_NAME, { keyPath: 'id', autoIncrement: true });
           }
         };
         req.onsuccess = () => resolve(req.result);
@@ -144,10 +149,121 @@
       })).catch(() => {}); // gagal simpan cache bukan error fatal, diamkan saja
     }
 
+    // ==========================================
+    // ANTRIAN TULIS OFFLINE (Lapisan 4): kalau kasir bikin transaksi atau absen saat
+    // TIDAK ADA internet, datanya TIDAK hilang -- disimpan dulu di HP (IndexedDB),
+    // aplikasi tetap menganggapnya "berhasil" (struk tetap bisa dicetak, keranjang
+    // tetap kekosong seperti biasa), lalu OTOMATIS dikirim ke server begitu internet
+    // kembali -- tanpa kasir perlu input ulang apapun.
+    // ==========================================
+    const OFFLINE_QUEUEABLE_FUNCTIONS = ['saveTransaction', 'recordAttendance'];
+
+    function queueAddWrite(payload) {
+      return openOfflineDb().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction(QUEUE_STORE_NAME, 'readwrite');
+        const req = tx.objectStore(QUEUE_STORE_NAME).add(payload);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }));
+    }
+
+    function queueGetAllWrites() {
+      return openOfflineDb().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction(QUEUE_STORE_NAME, 'readonly');
+        const req = tx.objectStore(QUEUE_STORE_NAME).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      })).catch(() => []);
+    }
+
+    function queueRemoveWrite(id) {
+      return openOfflineDb().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction(QUEUE_STORE_NAME, 'readwrite');
+        const req = tx.objectStore(QUEUE_STORE_NAME).delete(id);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      })).catch(() => {});
+    }
+
+    // Buat "hasil seolah-olah berhasil" persis format asli dari server, supaya kode
+    // yang sudah ada (cetak struk, tampilkan waktu absen, dst) tetap jalan normal
+    // tanpa perlu tahu bahwa ini sebenarnya belum benar-benar tersimpan di server.
+    function buildOptimisticResult(functionName) {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      if (functionName === 'saveTransaction') {
+        const offlineTrxId = 'TRX-' + Date.now().toString().slice(-6);
+        const offlineDate = pad(now.getDate()) + '/' + pad(now.getMonth() + 1) + '/' + String(now.getFullYear()).slice(-2) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+        return { success: true, trxId: offlineTrxId, date: offlineDate };
+      }
+      if (functionName === 'recordAttendance') {
+        return { success: true, timestamp: now.toLocaleString('id-ID') };
+      }
+      return { success: true };
+    }
+
+    let isSyncingOfflineQueue = false;
+
+    // Coba kirim semua transaksi/absensi yang masih menunggu di antrian. Dipanggil
+    // otomatis (lihat pemasangan listener 'online' & interval di bawah), TIDAK
+    // perlu dipanggil manual dari tempat lain.
+    async function trySyncOfflineQueue() {
+      if (isSyncingOfflineQueue || !navigator.onLine) return;
+      isSyncingOfflineQueue = true;
+      try {
+        const pending = await queueGetAllWrites();
+        for (const item of pending) {
+          try {
+            const res = await runGoogleScriptRaw(item.functionName, ...item.args);
+            if (res && res.success) {
+              // Untuk transaksi, pengurangan stok bahan baku baru dikirim SEKARANG
+              // (pakai trxId ASLI dari server, bukan trxId sementara tadi).
+              if (item.functionName === 'saveTransaction') {
+                const items = item.args[4];
+                const branchId = item.args[8];
+                runGoogleScriptRaw('deductStockForSale', items, res.trxId, branchId).catch(() => {});
+              }
+              await queueRemoveWrite(item.id);
+              console.log('[Sinkron] Berhasil mengirim ' + item.functionName + ' yang tertunda (ID lokal: ' + item.id + ')');
+            } else {
+              // Ditolak server (misal data tidak valid) -- bukan soal koneksi, jangan
+              // diulang terus-menerus. Biarkan tersimpan supaya Owner bisa cek manual.
+              break;
+            }
+          } catch (err) {
+            // Kemungkinan besar koneksi putus lagi di tengah proses -- hentikan,
+            // nanti dicoba lagi otomatis (lewat event 'online' atau interval berkala).
+            break;
+          }
+        }
+      } finally {
+        isSyncingOfflineQueue = false;
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => { trySyncOfflineQueue(); });
+      setInterval(trySyncOfflineQueue, 30000); // jaga-jaga, coba lagi tiap 30 detik
+      setTimeout(trySyncOfflineQueue, 3000); // coba sekali di awal, siapa tahu ada antrian dari sesi sebelumnya
+    }
+
     // Versi yang BENAR-BENAR dipakai di seluruh aplikasi (semua pemanggilan
     // runGoogleScript(...) yang sudah ada otomatis lewat sini, tidak perlu diubah
     // satu-satu di tempat lain).
     const runGoogleScript = (functionName, ...args) => {
+      // Transaksi & absensi: kalau gagal (kemungkinan besar offline), simpan ke
+      // antrian lokal dan kembalikan hasil "seolah berhasil" supaya alur aplikasi
+      // (cetak struk, dst) tetap berjalan seperti biasa.
+      if (OFFLINE_QUEUEABLE_FUNCTIONS.indexOf(functionName) !== -1) {
+        return runGoogleScriptRaw(functionName, ...args).catch((err) => {
+          const optimistic = buildOptimisticResult(functionName);
+          return queueAddWrite({ functionName, args, optimistic, createdAt: Date.now() }).then(() => {
+            console.warn('[Offline] ' + functionName + ' disimpan ke antrian lokal, akan otomatis dikirim begitu online.');
+            return Object.assign({}, optimistic, { offlineQueued: true });
+          });
+        });
+      }
+
       const isCacheable = OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1;
       const cacheKey = functionName + ':' + JSON.stringify(args);
 
@@ -982,6 +1098,7 @@
         return (
           <NotificationContext.Provider value={notificationAPI}>
             <OfflineIndicator />
+            <PendingSyncBadge />
             <LoginScreen onLogin={handleLoginSuccess} />
             <CustomNotificationModal config={alertConfig} onClose={closeAlert} />
           </NotificationContext.Provider>
@@ -991,6 +1108,7 @@
       return (
         <NotificationContext.Provider value={notificationAPI}>
           <OfflineIndicator />
+          <PendingSyncBadge />
           <div className="min-h-screen">
             {user.role === 'Owner' ? (
               <OwnerDashboard user={user} branch={branch} onChangeBranch={handleChangeBranch} onLogout={handleLogout} settings={settings} onRefreshSettings={loadSettings} />
@@ -1028,6 +1146,48 @@
         <div className="fixed top-0 left-0 right-0 z-[9999] bg-amber-500 text-white text-xs font-bold text-center py-1.5 shadow-md">
           <i className="fa-solid fa-wifi-slash mr-1.5"></i>
           Offline — menampilkan data tersimpan terakhir, mungkin tidak 100% terbaru
+        </div>
+      );
+    }
+
+    // Pita kecil menunjukkan berapa transaksi/absensi yang masih menunggu dikirim
+    // ke server (dibuat saat offline). Dipantau berkala (bukan real-time sempurna,
+    // tapi cukup untuk memberi rasa aman ke kasir/Owner bahwa datanya "aman menunggu",
+    // bukan hilang). Otomatis hilang begitu semuanya berhasil terkirim.
+    function PendingSyncBadge() {
+      const [pendingCount, setPendingCount] = useState(0);
+      const [syncing, setSyncing] = useState(false);
+
+      const refreshCount = () => {
+        queueGetAllWrites().then(list => setPendingCount(list.length)).catch(() => {});
+      };
+
+      useEffect(() => {
+        refreshCount();
+        const interval = setInterval(refreshCount, 5000);
+        window.addEventListener('online', refreshCount);
+        return () => {
+          clearInterval(interval);
+          window.removeEventListener('online', refreshCount);
+        };
+      }, []);
+
+      if (pendingCount === 0) return null;
+
+      const handleSyncNow = async () => {
+        setSyncing(true);
+        await trySyncOfflineQueue();
+        refreshCount();
+        setSyncing(false);
+      };
+
+      return (
+        <div className="fixed bottom-4 right-4 z-[9999] bg-slate-800 text-white rounded-xl shadow-lg px-4 py-3 flex items-center gap-3 text-sm">
+          <i className="fa-solid fa-clock-rotate-left text-amber-400"></i>
+          <span className="font-semibold">{pendingCount} data menunggu sinkron</span>
+          <button onClick={handleSyncNow} disabled={syncing || !navigator.onLine} className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-500 text-white px-3 py-1 rounded-lg text-xs font-bold transition-colors">
+            {syncing ? <i className="fa-solid fa-spinner fa-spin"></i> : 'Sinkron Sekarang'}
+          </button>
         </div>
       );
     }
@@ -6976,7 +7136,8 @@
               items: cart,
               total,
               cashReceived: finalCashReceived,
-              change: finalChange
+              change: finalChange,
+              offlineQueued: res.offlineQueued || false
             });
 
             // Pengurangan stok bahan baku dijalankan di LATAR BELAKANG, sengaja TIDAK
@@ -7364,6 +7525,12 @@
                   </div>
                   <h3 className="font-bold text-xl text-gray-800">Pembayaran Sukses</h3>
                   <p className="text-gray-500 text-sm mt-1">Transaksi berhasil disimpan!</p>
+                  {lastTrx.offlineQueued && (
+                    <div className="mt-2 inline-flex items-center gap-1.5 bg-amber-50 text-amber-700 text-[11px] font-bold px-3 py-1 rounded-full">
+                      <i className="fa-solid fa-clock-rotate-left"></i>
+                      Tersimpan offline — akan otomatis sinkron begitu online
+                    </div>
+                  )}
                 </div>
 
                 <div className="p-5">
