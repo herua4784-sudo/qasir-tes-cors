@@ -12,7 +12,7 @@
 // Naikkan angka versi ini (v1 -> v2 -> dst) SETIAP kali Index.html diperbarui,
 // supaya HP pengguna otomatis unduh ulang versi terbaru, bukan versi lama yang
 // ketinggalan tersimpan di cache.
-const CACHE_NAME = 'qasir-minumes-v1';
+const CACHE_NAME = 'qasir-minumes-v2';
 
 const APP_SHELL = [
   './',
@@ -23,13 +23,28 @@ const APP_SHELL = [
 ];
 
 // INSTALL — dipanggil sekali saat Service Worker pertama kali terpasang di HP.
+// PENTING: tiap file disimpan SENDIRI-SENDIRI (bukan pakai cache.addAll yang
+// sifatnya "semua-atau-tidak-sama-sekali"). Kalau satu file gagal diambil (misal
+// belum sempat ke-upload atau namanya sedikit beda), file yang lain TETAP berhasil
+// disimpan -- supaya aplikasi tetap punya sesuatu untuk ditampilkan saat offline.
 self.addEventListener('install', (event) => {
   self.skipWaiting(); // langsung aktif, tidak perlu tunggu tab lama ditutup semua
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(APP_SHELL).catch((err) => {
-        console.warn('Sebagian file gagal disimpan ke cache saat install:', err);
-      });
+      return Promise.all(
+        APP_SHELL.map((url) =>
+          fetch(url)
+            .then((response) => {
+              if (response && response.ok) {
+                return cache.put(url, response);
+              }
+              console.warn('[SW] Gagal simpan (status ' + (response ? response.status : '?') + '):', url);
+            })
+            .catch((err) => {
+              console.warn('[SW] Gagal ambil untuk disimpan ke cache:', url, err);
+            })
+        )
+      );
     })
   );
 });
