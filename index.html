@@ -108,7 +108,7 @@
     // SENGAJA dibatasi ke data yang jarang berubah & bukan aksi/transaksi — bukan
     // untuk data transaksi (itu harus selalu real-time, tidak boleh "nyangkut" versi lama).
     // ==========================================
-    const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients', 'getTodayCashierTransactions', 'getTransactions'];
+    const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients', 'getTodayCashierTransactions', 'getTransactions', 'getTodayAttendance', 'getStockMovements'];
     const OFFLINE_DB_NAME = 'qasir_offline_cache';
     const OFFLINE_STORE_NAME = 'kv';
     const QUEUE_STORE_NAME = 'pending_writes';
@@ -156,7 +156,7 @@
     // tetap kekosong seperti biasa), lalu OTOMATIS dikirim ke server begitu internet
     // kembali -- tanpa kasir perlu input ulang apapun.
     // ==========================================
-    const OFFLINE_QUEUEABLE_FUNCTIONS = ['saveTransaction', 'recordAttendance'];
+    const OFFLINE_QUEUEABLE_FUNCTIONS = ['saveTransaction', 'recordAttendance', 'recordStockMovement'];
 
     function queueAddWrite(payload) {
       return openOfflineDb().then(db => new Promise((resolve, reject) => {
@@ -198,6 +198,13 @@
       }
       if (functionName === 'recordAttendance') {
         return { success: true, timestamp: now.toLocaleString('id-ID') };
+      }
+      if (functionName === 'recordStockMovement') {
+        // Stok baru yang SEBENARNYA tidak bisa dipastikan sekarang (tergantung stok
+        // server saat ini, yang tidak diketahui pasti saat offline) -- newStock
+        // sengaja null, ditangani khusus di tampilan (pesan sukses generik, bukan
+        // angka spesifik yang bisa salah).
+        return { success: true, newStock: null };
       }
       return { success: true };
     }
@@ -247,6 +254,90 @@
       setTimeout(trySyncOfflineQueue, 3000); // coba sekali di awal, siapa tahu ada antrian dari sesi sebelumnya
     }
 
+    // Fungsi mana saja yang hasilnya perlu "digabung" dengan data di antrian
+    // offline yang masih menunggu sinkron -- supaya kasir langsung lihat hasil
+    // kerjanya sendiri (transaksi/absensi barusan) di Riwayat, TANPA perlu
+    // menunggu proses sinkron ke server selesai dulu.
+    const MERGE_WITH_QUEUE_FUNCTIONS = ['getTodayCashierTransactions', 'getTransactions', 'getTodayAttendance', 'getStockMovements'];
+
+    function mergeQueuedIntoResult(functionName, args, result) {
+      return queueGetAllWrites().then((pending) => {
+        if (!pending || pending.length === 0) return result;
+
+        if (functionName === 'getTodayCashierTransactions' || functionName === 'getTransactions') {
+          const cashierFilter = functionName === 'getTodayCashierTransactions' ? args[0] : null;
+          const branchFilter = functionName === 'getTodayCashierTransactions' ? args[1] : args[0];
+          const extra = pending
+            .filter(item => item.functionName === 'saveTransaction')
+            .filter(item => {
+              const cashier = item.args[0], branchId = item.args[8];
+              if (cashierFilter && cashier !== cashierFilter) return false;
+              if (branchFilter && branchId !== branchFilter) return false;
+              return true;
+            })
+            .map(item => {
+              const [cashier, subtotal, tax, total, items, paymentMethod, cashReceived, change, branchId] = item.args;
+              return {
+                TRX_ID: item.optimistic.trxId, Date: item.optimistic.date, Cashier: cashier,
+                Subtotal: subtotal, Tax: tax, Total: total, Items: JSON.stringify(items),
+                Payment_Method: paymentMethod, Cash_Received: cashReceived, Change: change,
+                Branch_ID: branchId, _pendingSync: true
+              };
+            });
+          return extra.concat(result || []); // transaksi offline ditaruh paling atas (terbaru)
+        }
+
+        if (functionName === 'getTodayAttendance') {
+          const usernameFilter = args[0];
+          const branchFilter = args[1];
+          const now = new Date();
+          const todayDateStr = now.getDate() + '/' + (now.getMonth() + 1) + '/' + now.getFullYear();
+          const extra = pending
+            .filter(item => item.functionName === 'recordAttendance')
+            .filter(item => {
+              const username = item.args[0], branchId = item.args[2];
+              if (usernameFilter && username !== usernameFilter) return false;
+              if (branchFilter && branchId !== branchFilter) return false;
+              return true;
+            })
+            .map(item => {
+              const [username, type, branchId, shift] = item.args;
+              return {
+                Date: todayDateStr, Username: username, Type: type,
+                Timestamp: item.optimistic.timestamp, Branch_ID: branchId,
+                Shift: type === 'Clock In' ? (shift || '') : '', _pendingSync: true
+              };
+            });
+          return (result || []).concat(extra); // absensi offline ditaruh di akhir (urut waktu)
+        }
+
+        if (functionName === 'getStockMovements') {
+          const branchFilter = args[0];
+          const now = new Date();
+          const pad = (n) => String(n).padStart(2, '0');
+          const nowDateStr = pad(now.getDate()) + '/' + pad(now.getMonth() + 1) + '/' + String(now.getFullYear()).slice(-2) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+          const extra = pending
+            .filter(item => item.functionName === 'recordStockMovement')
+            .filter(item => {
+              const branchId = item.args[6];
+              if (branchFilter && branchId !== branchFilter) return false;
+              return true;
+            })
+            .map(item => {
+              const [ingredientId, type, qty, reason, reference, unitType, branchId, customCost] = item.args;
+              return {
+                ID: 'MV-PENDING-' + item.id, Date: nowDateStr, Ingredient_ID: ingredientId,
+                Type: type, Qty: qty, Reason: reason, Reference: reference,
+                Branch_ID: branchId, Custom_Cost: customCost || '', _pendingSync: true
+              };
+            });
+          return extra.concat(result || []); // pergerakan offline ditaruh paling atas (terbaru)
+        }
+
+        return result;
+      }).catch(() => result); // gagal baca antrian bukan alasan gagalkan tampilan, kembalikan hasil asli
+    }
+
     // Versi yang BENAR-BENAR dipakai di seluruh aplikasi (semua pemanggilan
     // runGoogleScript(...) yang sudah ada otomatis lewat sini, tidak perlu diubah
     // satu-satu di tempat lain).
@@ -267,28 +358,37 @@
       const isCacheable = OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1;
       const cacheKey = functionName + ':' + JSON.stringify(args);
 
-      if (!isCacheable) return runGoogleScriptRaw(functionName, ...args);
+      let resultPromise;
+      if (!isCacheable) {
+        resultPromise = runGoogleScriptRaw(functionName, ...args);
+      } else {
+        // STRATEGI "TAMPILKAN DULU, PERBARUI BELAKANGAN" (stale-while-revalidate):
+        // kalau sudah ada data tersimpan dari kunjungan sebelumnya, PAKAI ITU DULU
+        // secara INSTAN (tidak perlu menunggu server GAS merespons, yang kadang
+        // lambat di panggilan pertama / "cold start"). Data terbaru tetap diambil
+        // di LATAR BELAKANG untuk memperbarui simpanan, dipakai di kunjungan
+        // berikutnya -- tanpa bikin tampilan sekarang harus menunggu.
+        const freshPromise = runGoogleScriptRaw(functionName, ...args).then((result) => {
+          offlineCacheSet(cacheKey, result); // perbarui simpanan untuk lain kali
+          return result;
+        });
 
-      // STRATEGI "TAMPILKAN DULU, PERBARUI BELAKANGAN" (stale-while-revalidate):
-      // kalau sudah ada data tersimpan dari kunjungan sebelumnya, PAKAI ITU DULU
-      // secara INSTAN (tidak perlu menunggu server GAS merespons, yang kadang
-      // lambat di panggilan pertama / "cold start"). Data terbaru tetap diambil
-      // di LATAR BELAKANG untuk memperbarui simpanan, dipakai di kunjungan
-      // berikutnya -- tanpa bikin tampilan sekarang harus menunggu.
-      const freshPromise = runGoogleScriptRaw(functionName, ...args).then((result) => {
-        offlineCacheSet(cacheKey, result); // perbarui simpanan untuk lain kali
-        return result;
-      });
+        resultPromise = offlineCacheGet(cacheKey).then((cached) => {
+          if (cached !== undefined) {
+            freshPromise.catch(() => {}); // biarkan jalan di belakang, abaikan kalau gagal
+            return cached;
+          }
+          // Belum pernah ada simpanan sama sekali (kunjungan pertama) -- terpaksa
+          // tunggu server, sudah tidak ada cadangan lagi kalau ini juga gagal.
+          return freshPromise;
+        });
+      }
 
-      return offlineCacheGet(cacheKey).then((cached) => {
-        if (cached !== undefined) {
-          freshPromise.catch(() => {}); // biarkan jalan di belakang, abaikan kalau gagal
-          return cached;
-        }
-        // Belum pernah ada simpanan sama sekali (kunjungan pertama) -- terpaksa
-        // tunggu server, sudah tidak ada cadangan lagi kalau ini juga gagal.
-        return freshPromise;
-      });
+      if (MERGE_WITH_QUEUE_FUNCTIONS.indexOf(functionName) !== -1) {
+        return resultPromise.then((result) => mergeQueuedIntoResult(functionName, args, result));
+      }
+
+      return resultPromise;
     };
 
     // ==========================================
@@ -4188,7 +4288,11 @@
           );
           if (res.success) {
             invalidateCache('ingredients_' + branchId);
-            notify.alert(`Berhasil dicatat. Stok "${selectedIngredient ? selectedIngredient.Name : ''}" sekarang: ${res.newStock} ${selectedIngredient ? selectedIngredient.Unit : ''}`, "Berhasil", "success");
+            if (res.offlineQueued) {
+              notify.alert(`Tersimpan offline. Stok "${selectedIngredient ? selectedIngredient.Name : ''}" akan diperbarui otomatis begitu tersinkron.`, "Tersimpan Offline", "success");
+            } else {
+              notify.alert(`Berhasil dicatat. Stok "${selectedIngredient ? selectedIngredient.Name : ''}" sekarang: ${res.newStock} ${selectedIngredient ? selectedIngredient.Unit : ''}`, "Berhasil", "success");
+            }
             setQty('');
             setCustomPriceMode(false);
             setCustomPrice('');
@@ -4320,7 +4424,11 @@
           );
           if (res.success) {
             invalidateCache('ingredients_' + branchId);
-            notify.alert(`Stok berhasil dicatat. Stok terbaru: ${res.newStock} ${selectedIngredient ? selectedIngredient.Unit : ''}`, "Berhasil", "success");
+            if (res.offlineQueued) {
+              notify.alert("Tersimpan offline. Stok akan diperbarui otomatis begitu tersinkron.", "Tersimpan Offline", "success");
+            } else {
+              notify.alert(`Stok berhasil dicatat. Stok terbaru: ${res.newStock} ${selectedIngredient ? selectedIngredient.Unit : ''}`, "Berhasil", "success");
+            }
             setQty('');
             setReason('');
             loadData();
@@ -4468,7 +4576,14 @@
                   ) : (
                     displayed.map((m, i) => (
                       <tr key={i} className="border-b border-gray-50 hover:bg-slate-50">
-                        <td className="p-4 text-gray-500">{m.Date}</td>
+                        <td className="p-4 text-gray-500">
+                          {m.Date}
+                          {m._pendingSync && (
+                            <span className="ml-2 inline-flex items-center gap-1 bg-amber-100 text-amber-700 text-[10px] font-bold px-2 py-0.5 rounded-full align-middle">
+                              <i className="fa-solid fa-clock-rotate-left"></i>Belum Sinkron
+                            </span>
+                          )}
+                        </td>
                         <td className="p-4 font-bold text-gray-800">{getIngredientName(m.Ingredient_ID)}</td>
                         <td className="p-4">
                           <span className={`px-2.5 py-1 rounded-lg text-xs font-bold ${m.Type === 'Masuk' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
@@ -5045,7 +5160,14 @@
                   ) : (
                     timeFilteredTrx.map((t, i) => (
                       <tr key={i} className="border-b hover:bg-gray-50">
-                        <td className="p-4 font-medium font-mono text-indigo-600">{t.TRX_ID}</td>
+                        <td className="p-4 font-medium font-mono text-indigo-600">
+                          {t.TRX_ID}
+                          {t._pendingSync && (
+                            <span className="ml-2 inline-flex items-center gap-1 bg-amber-100 text-amber-700 text-[10px] font-bold px-2 py-0.5 rounded-full align-middle">
+                              <i className="fa-solid fa-clock-rotate-left"></i>Belum Sinkron
+                            </span>
+                          )}
+                        </td>
                         <td className="p-4 text-gray-500">{t.Date}</td>
                         <td className="p-4 font-semibold text-gray-700">{t.Cashier}</td>
                         {allowBranchFilter && viewBranchId === 'ALL' && (
@@ -5261,7 +5383,14 @@
               <div className="space-y-2">
                 {myRecords.map((r, i) => (
                   <div key={i} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2.5">
-                    {typeBadge(r.Type)}
+                    <div className="flex items-center gap-2">
+                      {typeBadge(r.Type)}
+                      {r._pendingSync && (
+                        <span className="inline-flex items-center gap-1 bg-amber-100 text-amber-700 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                          <i className="fa-solid fa-clock-rotate-left"></i>Belum Sinkron
+                        </span>
+                      )}
+                    </div>
                     <span className="text-xs text-gray-500 font-semibold">{r.Timestamp}</span>
                   </div>
                 ))}
