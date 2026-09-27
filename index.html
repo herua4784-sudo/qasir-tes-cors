@@ -267,24 +267,28 @@
       const isCacheable = OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1;
       const cacheKey = functionName + ':' + JSON.stringify(args);
 
-      const callPromise = runGoogleScriptRaw(functionName, ...args);
+      if (!isCacheable) return runGoogleScriptRaw(functionName, ...args);
 
-      if (!isCacheable) return callPromise;
+      // STRATEGI "TAMPILKAN DULU, PERBARUI BELAKANGAN" (stale-while-revalidate):
+      // kalau sudah ada data tersimpan dari kunjungan sebelumnya, PAKAI ITU DULU
+      // secara INSTAN (tidak perlu menunggu server GAS merespons, yang kadang
+      // lambat di panggilan pertama / "cold start"). Data terbaru tetap diambil
+      // di LATAR BELAKANG untuk memperbarui simpanan, dipakai di kunjungan
+      // berikutnya -- tanpa bikin tampilan sekarang harus menunggu.
+      const freshPromise = runGoogleScriptRaw(functionName, ...args).then((result) => {
+        offlineCacheSet(cacheKey, result); // perbarui simpanan untuk lain kali
+        return result;
+      });
 
-      return callPromise
-        .then((result) => {
-          offlineCacheSet(cacheKey, result); // simpan diam-diam, tidak perlu ditunggu
-          return result;
-        })
-        .catch((err) => {
-          return offlineCacheGet(cacheKey).then((cached) => {
-            if (cached !== undefined) {
-              console.warn('[Offline] Menampilkan data tersimpan untuk', functionName);
-              return cached;
-            }
-            throw err; // tidak ada data tersimpan sama sekali, lempar error asli
-          });
-        });
+      return offlineCacheGet(cacheKey).then((cached) => {
+        if (cached !== undefined) {
+          freshPromise.catch(() => {}); // biarkan jalan di belakang, abaikan kalau gagal
+          return cached;
+        }
+        // Belum pernah ada simpanan sama sekali (kunjungan pertama) -- terpaksa
+        // tunggu server, sudah tidak ada cadangan lagi kalau ini juga gagal.
+        return freshPromise;
+      });
     };
 
     // ==========================================
@@ -1243,9 +1247,7 @@
           }
         } catch (err) { 
           setError('Terjadi kesalahan koneksi.'); 
-          // SEMENTARA: tampilkan pesan error ASLI (biasanya disamarkan demi kasir)
-          // supaya bisa didiagnosa dulu penyebab pastinya.
-          notify.alert("Detail teknis: " + (err && err.message ? err.message : String(err)), "Debug Sementara", "error");
+          notify.alert("Gagal melakukan autentikasi. Hubungi pemilik sistem.", "Masalah Koneksi", "error");
         }
         setLoading(false);
       };
