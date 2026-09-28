@@ -110,7 +110,7 @@
     // SENGAJA dibatasi ke data yang jarang berubah & bukan aksi/transaksi — bukan
     // untuk data transaksi (itu harus selalu real-time, tidak boleh "nyangkut" versi lama).
     // ==========================================
-    const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients', 'getTodayCashierTransactions', 'getTransactions', 'getTodayAttendance', 'getStockMovements'];
+    const OFFLINE_CACHEABLE_FUNCTIONS = ['getProducts', 'getCategories', 'getBranches', 'getIngredients', 'getSettings', 'getTodayCashierTransactions', 'getTransactions', 'getTodayAttendance', 'getStockMovements'];
     const OFFLINE_DB_NAME = 'qasir_offline_cache';
     const OFFLINE_STORE_NAME = 'kv';
     const QUEUE_STORE_NAME = 'pending_writes';
@@ -261,6 +261,8 @@
             }
           }
           await queueRemoveWrite(item.id);
+          markReadsDirty(item.functionName);
+          if (item.functionName === 'saveTransaction') markReadsDirty('deductStockForSale');
           window.__lastSyncError = '';
           console.log('[Sinkron] Berhasil mengirim ' + item.functionName + ' (ID lokal: ' + item.id + ')');
         } catch (err) {
@@ -395,15 +397,96 @@
       }).catch(() => result); // gagal baca antrian bukan alasan gagalkan tampilan, kembalikan hasil asli
     }
 
+    // ==========================================
+    // BACA DATA DENGAN SIMPANAN OFFLINE
+    // - Data acuan yang jarang berubah (cabang, produk, kategori, bahan, pengaturan):
+    //   kalau ada simpanan, tampil INSTAN; server memperbarui di belakang layar.
+    // - TAPI begitu ada perubahan yang memengaruhinya (mis. Owner mengedit produk),
+    //   pembacaan berikutnya mengambil data SEGAR dari server (simpanan lama hanya
+    //   dipakai kalau server gagal), supaya daftar tidak menampilkan versi lama.
+    // - Riwayat (transaksi, absensi, pergerakan stok): selalu utamakan data terbaru;
+    //   simpanan hanya cadangan kalau server gagal atau terlalu lama menjawab.
+    // ==========================================
+    const SWR_FUNCTIONS = ['getBranches', 'getProducts', 'getCategories', 'getIngredients', 'getSettings'];
+    const NETWORK_FIRST_TIMEOUT_MS = 12000;
+
+    // Perubahan apa memengaruhi hasil baca apa.
+    const MUTATION_AFFECTS = {
+      manageProduct: ['getProducts'],
+      copyProductPricing: ['getProducts'],
+      syncAllProductCostPrices: ['getProducts'],
+      manageRecipe: ['getProducts'],
+      manageCategory: ['getCategories', 'getProducts'],
+      manageIngredient: ['getIngredients', 'getProducts'],
+      recalculateIngredientCost: ['getIngredients', 'getProducts'],
+      copyRecipeData: ['getIngredients'],
+      produceBatch: ['getIngredients'],
+      recordStockMovement: ['getIngredients'],
+      deductStockForSale: ['getIngredients'],
+      manageBranch: ['getBranches'],
+      saveSetting: ['getSettings']
+    };
+
+    const readVersion = {};   // nama fungsi baca -> penghitung (naik tiap ada perubahan data)
+    const readFetchedAt = {}; // kunci simpanan -> versi saat terakhir diambil dari server
+
+    function markReadsDirty(functionName) {
+      (MUTATION_AFFECTS[functionName] || []).forEach(function (readFn) {
+        readVersion[readFn] = (readVersion[readFn] || 0) + 1;
+      });
+    }
+
+    function cachedRead(functionName, args) {
+      const cacheKey = functionName + ':' + JSON.stringify(args);
+      const versionAtRequest = readVersion[functionName] || 0;
+      const isDirty = (readFetchedAt[cacheKey] || 0) < versionAtRequest;
+
+      const fromServer = runGoogleScriptRaw(functionName, ...args).then(function (result) {
+        offlineCacheSet(cacheKey, result); // perbarui simpanan untuk lain kali
+        readFetchedAt[cacheKey] = Math.max(readFetchedAt[cacheKey] || 0, versionAtRequest);
+        return result;
+      });
+      // Tandai "sudah ditangani" supaya kegagalan di latar belakang tidak jadi galat
+      // "promise tidak ditangani". Pemanggil tetap menerima kegagalannya lewat fromServer.
+      fromServer.catch(function () {});
+
+      // Data acuan & tidak sedang "kotor" -> pakai simpanan langsung (instan).
+      if (SWR_FUNCTIONS.indexOf(functionName) !== -1 && !isDirty) {
+        return offlineCacheGet(cacheKey).then(function (cached) {
+          return cached !== undefined ? cached : fromServer;
+        });
+      }
+
+      // Selain itu: utamakan server; simpanan jadi cadangan kalau gagal/terlalu lama.
+      let timer;
+      const timeout = new Promise(function (_, reject) {
+        timer = setTimeout(function () { reject(new Error('Server terlalu lama merespons')); }, NETWORK_FIRST_TIMEOUT_MS);
+      });
+      timeout.catch(function () {});
+      return Promise.race([fromServer, timeout]).then(
+        function (result) { clearTimeout(timer); return result; },
+        function (err) {
+          clearTimeout(timer);
+          return offlineCacheGet(cacheKey).then(function (cached) {
+            if (cached !== undefined) return cached;
+            throw err;
+          });
+        }
+      );
+    }
+
     // Versi yang BENAR-BENAR dipakai di seluruh aplikasi (semua pemanggilan
     // runGoogleScript(...) yang sudah ada otomatis lewat sini, tidak perlu diubah
     // satu-satu di tempat lain).
     const runGoogleScript = (functionName, ...args) => {
-      // Transaksi & absensi: kalau gagal (kemungkinan besar offline), simpan ke
-      // antrian lokal dan kembalikan hasil "seolah berhasil" supaya alur aplikasi
-      // (cetak struk, dst) tetap berjalan seperti biasa.
+      // Transaksi & absensi & stok masuk: kalau gagal (kemungkinan besar offline),
+      // simpan ke antrian lokal dan kembalikan hasil "seolah berhasil" supaya alur
+      // aplikasi (cetak struk, dst) tetap berjalan seperti biasa.
       if (OFFLINE_QUEUEABLE_FUNCTIONS.indexOf(functionName) !== -1) {
-        return runGoogleScriptRaw(functionName, ...args).catch((err) => {
+        return runGoogleScriptRaw(functionName, ...args).then((res) => {
+          if (res && res.success !== false) markReadsDirty(functionName);
+          return res;
+        }).catch((err) => {
           const optimistic = buildOptimisticResult(functionName);
           return queueAddWrite({ functionName, args, optimistic, createdAt: Date.now() }).then(() => {
             console.warn('[Offline] ' + functionName + ' disimpan ke antrian lokal, akan otomatis dikirim begitu online.');
@@ -412,32 +495,16 @@
         });
       }
 
-      const isCacheable = OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1;
-      const cacheKey = functionName + ':' + JSON.stringify(args);
-
       let resultPromise;
-      if (!isCacheable) {
-        resultPromise = runGoogleScriptRaw(functionName, ...args);
+      if (OFFLINE_CACHEABLE_FUNCTIONS.indexOf(functionName) !== -1) {
+        resultPromise = cachedRead(functionName, args);
       } else {
-        // STRATEGI "TAMPILKAN DULU, PERBARUI BELAKANGAN" (stale-while-revalidate):
-        // kalau sudah ada data tersimpan dari kunjungan sebelumnya, PAKAI ITU DULU
-        // secara INSTAN (tidak perlu menunggu server GAS merespons, yang kadang
-        // lambat di panggilan pertama / "cold start"). Data terbaru tetap diambil
-        // di LATAR BELAKANG untuk memperbarui simpanan, dipakai di kunjungan
-        // berikutnya -- tanpa bikin tampilan sekarang harus menunggu.
-        const freshPromise = runGoogleScriptRaw(functionName, ...args).then((result) => {
-          offlineCacheSet(cacheKey, result); // perbarui simpanan untuk lain kali
-          return result;
-        });
-
-        resultPromise = offlineCacheGet(cacheKey).then((cached) => {
-          if (cached !== undefined) {
-            freshPromise.catch(() => {}); // biarkan jalan di belakang, abaikan kalau gagal
-            return cached;
-          }
-          // Belum pernah ada simpanan sama sekali (kunjungan pertama) -- terpaksa
-          // tunggu server, sudah tidak ada cadangan lagi kalau ini juga gagal.
-          return freshPromise;
+        // Fungsi lain (login, tambah/edit/hapus, dst): langsung ke server. Kalau
+        // berhasil mengubah data, tandai hasil baca yang terkait sebagai "kotor"
+        // supaya pembacaan berikutnya mengambil data segar, bukan simpanan lama.
+        resultPromise = runGoogleScriptRaw(functionName, ...args).then((res) => {
+          if (res && res.success !== false) markReadsDirty(functionName);
+          return res;
         });
       }
 
@@ -1377,6 +1444,99 @@
       );
     }
 
+    // ==========================================
+    // LOGIN OFFLINE: setelah seorang pegawai berhasil login SAAT ONLINE, tablet
+    // menyimpan "sidik jari" password-nya (PBKDF2 + salt acak -- BUKAN password
+    // aslinya) di penyimpanan lokal. Kalau nanti internet mati dan pegawai itu login
+    // lagi, password yang diketik dicocokkan ke sidik jari tersebut.
+    // Pengaman: (1) hanya akun yang pernah login online di perangkat ini,
+    // (2) kedaluwarsa 7 hari sejak login online terakhir, (3) dicabut otomatis kalau
+    // server menyatakan password/akun tidak valid, (4) dikunci 60 detik setelah 5x salah.
+    // ==========================================
+    const OFFLINE_LOGIN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+    const OFFLINE_LOGIN_ITERATIONS = 150000;
+    const OFFLINE_LOGIN_MAX_FAILS = 5;
+    const OFFLINE_LOGIN_LOCK_MS = 60 * 1000;
+    const OFFLINE_LOGIN_FAIL_KEY = 'qasir_offline_login_fail';
+
+    function offlineLoginAvailable() {
+      return typeof crypto !== 'undefined' && !!crypto.subtle && typeof TextEncoder !== 'undefined';
+    }
+
+    function bytesToBase64(bytes) {
+      let s = '';
+      for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      return btoa(s);
+    }
+
+    function base64ToBytes(str) {
+      const bin = atob(str);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    }
+
+    async function derivePasswordHash(password, saltBytes, iterations) {
+      const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+      const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: saltBytes, iterations: iterations, hash: 'SHA-256' }, keyMaterial, 256);
+      return new Uint8Array(bits);
+    }
+
+    async function saveOfflineLogin(username, password, user) {
+      if (!offlineLoginAvailable()) return;
+      try {
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const hash = await derivePasswordHash(password, salt, OFFLINE_LOGIN_ITERATIONS);
+        await offlineCacheSet('auth:' + username, {
+          salt: bytesToBase64(salt), hash: bytesToBase64(hash),
+          iterations: OFFLINE_LOGIN_ITERATIONS, user: user, savedAt: Date.now()
+        });
+      } catch (e) { /* gagal menyimpan bukan masalah fatal: login offline saja yang tidak tersedia */ }
+    }
+
+    function clearOfflineLogin(username) {
+      return offlineCacheSet('auth:' + username, null);
+    }
+
+    function offlineLoginThrottleGet() {
+      try { return JSON.parse(localStorage.getItem(OFFLINE_LOGIN_FAIL_KEY) || '{}'); } catch (e) { return {}; }
+    }
+    function offlineLoginThrottleSave(state) {
+      try { localStorage.setItem(OFFLINE_LOGIN_FAIL_KEY, JSON.stringify(state)); } catch (e) {}
+    }
+
+    // Hasil: { ok: true, user } atau { ok: false, reason: 'unsupported' | 'locked' | 'no-record' | 'expired' | 'wrong', waitSec? }
+    async function verifyOfflineLogin(username, password) {
+      if (!offlineLoginAvailable()) return { ok: false, reason: 'unsupported' };
+      const throttle = offlineLoginThrottleGet();
+      if (throttle.until && throttle.until > Date.now()) {
+        return { ok: false, reason: 'locked', waitSec: Math.ceil((throttle.until - Date.now()) / 1000) };
+      }
+      const rec = await offlineCacheGet('auth:' + username);
+      if (!rec || !rec.hash) return { ok: false, reason: 'no-record' };
+      if (Date.now() - rec.savedAt > OFFLINE_LOGIN_MAX_AGE_MS) return { ok: false, reason: 'expired' };
+
+      let same = false;
+      try {
+        const hash = await derivePasswordHash(password, base64ToBytes(rec.salt), rec.iterations);
+        const expected = base64ToBytes(rec.hash);
+        let diff = hash.length === expected.length ? 0 : 1;
+        for (let i = 0; i < hash.length && i < expected.length; i++) diff |= hash[i] ^ expected[i];
+        same = diff === 0;
+      } catch (e) {
+        return { ok: false, reason: 'unsupported' };
+      }
+
+      if (same) {
+        offlineLoginThrottleSave({});
+        return { ok: true, user: rec.user };
+      }
+      const fails = (throttle.fails || 0) + 1;
+      if (fails >= OFFLINE_LOGIN_MAX_FAILS) offlineLoginThrottleSave({ fails: 0, until: Date.now() + OFFLINE_LOGIN_LOCK_MS });
+      else offlineLoginThrottleSave({ fails: fails });
+      return { ok: false, reason: 'wrong' };
+    }
+
     function LoginScreen({ onLogin }) {
       const [username, setUsername] = useState('');
       const [password, setPassword] = useState('');
@@ -1395,34 +1555,67 @@
           .catch(() => {});
       }, []);
 
+      // Menyelesaikan login (dipakai jalur online maupun offline): cek aturan outlet,
+      // lalu masuk. Mengembalikan false kalau login ditolak karena salah pilih outlet.
+      const finishLogin = (user) => {
+        const isOwner = user.role === 'Owner';
+        const ownBranchId = user.branchId;
+
+        // Pegawai (bukan Owner) hanya boleh login di cabang yang memang jadi tempatnya.
+        // (Kalau daftar cabang gagal dimuat sama sekali, pemeriksaan ini dilewati
+        // supaya pegawai tidak terkunci di luar hanya karena daftarnya kosong.)
+        if (!isOwner && ownBranchId && branches.length > 0 && branchId !== ownBranchId) {
+          const ownBranch = branches.find(b => b.ID === ownBranchId);
+          setError(`Akun ini terdaftar di outlet "${ownBranch ? ownBranch.Name : ownBranchId}". Silakan pilih outlet tersebut untuk masuk.`);
+          return false;
+        }
+
+        const selectedBranch = branches.find(b => b.ID === branchId);
+        onLogin(user, selectedBranch ? { ID: selectedBranch.ID, Name: selectedBranch.Name } : { ID: ownBranchId || 'BR001', Name: 'Cabang Utama' });
+        return true;
+      };
+
       const handleLogin = async (e) => {
         e.preventDefault();
         setLoading(true);
         setError('');
+        const uname = username.trim().toLowerCase();
         try {
-          const res = await runGoogleScript('authenticate', username.trim().toLowerCase(), password);
+          const res = await runGoogleScript('authenticate', uname, password);
           if (res.success) {
-            const isOwner = res.user.role === 'Owner';
-            const ownBranchId = res.user.branchId;
-
-            // Pegawai (bukan Owner) hanya boleh login di cabang yang memang jadi tempatnya.
-            if (!isOwner && ownBranchId) {
-              if (branchId !== ownBranchId) {
-                const ownBranch = branches.find(b => b.ID === ownBranchId);
-                setError(`Akun ini terdaftar di outlet "${ownBranch ? ownBranch.Name : ownBranchId}". Silakan pilih outlet tersebut untuk masuk.`);
-                setLoading(false);
-                return;
-              }
-            }
-
-            const selectedBranch = branches.find(b => b.ID === branchId);
-            onLogin(res.user, selectedBranch ? { ID: selectedBranch.ID, Name: selectedBranch.Name } : { ID: 'BR001', Name: 'Cabang Utama' });
+            // Simpan sidik jari password di tablet ini (tanpa menunggu) supaya lain
+            // kali bisa login walau internet mati.
+            saveOfflineLogin(uname, password, res.user);
+            finishLogin(res.user);
           } else {
+            // Server menyatakan akun/password tidak valid -> cabut izin login offline
+            // akun ini di perangkat ini (misal password sudah diganti Owner).
+            clearOfflineLogin(uname);
             setError(res.message);
           }
-        } catch (err) { 
-          setError('Terjadi kesalahan koneksi.'); 
-          notify.alert("Gagal melakukan autentikasi. Hubungi pemilik sistem.", "Masalah Koneksi", "error");
+        } catch (err) {
+          if (err && err.serverError) {
+            // Server merespons tapi bermasalah -- ini bukan soal internet, jangan
+            // dijawab dengan login offline.
+            setError('Terjadi kesalahan di server.');
+            notify.alert("Gagal melakukan autentikasi. Hubungi pemilik sistem.", "Masalah Server", "error");
+          } else {
+            // Tidak ada koneksi ke server -> coba login offline (hanya akun yang
+            // pernah login online di perangkat ini).
+            const offline = await verifyOfflineLogin(uname, password);
+            if (offline.ok) {
+              finishLogin(offline.user);
+            } else if (offline.reason === 'locked') {
+              setError(`Terlalu banyak percobaan salah. Coba lagi dalam ${offline.waitSec} detik.`);
+            } else if (offline.reason === 'wrong') {
+              setError('Username atau password salah.');
+            } else if (offline.reason === 'unsupported') {
+              setError('Tidak ada koneksi internet, dan browser ini tidak mendukung login offline.');
+            } else {
+              // 'no-record' atau 'expired'
+              setError('Tidak ada koneksi internet. Login offline hanya bisa untuk akun yang sudah pernah login online di tablet ini dalam 7 hari terakhir.');
+            }
+          }
         }
         setLoading(false);
       };
