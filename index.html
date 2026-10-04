@@ -1532,19 +1532,24 @@
     }
 
     // ==========================================
-    // LOGIN OFFLINE: setelah seorang pegawai berhasil login SAAT ONLINE, tablet
-    // menyimpan "sidik jari" password-nya (PBKDF2 + salt acak -- BUKAN password
-    // aslinya) di penyimpanan lokal. Kalau nanti internet mati dan pegawai itu login
-    // lagi, password yang diketik dicocokkan ke sidik jari tersebut.
-    // Pengaman: (1) hanya akun yang pernah login online di perangkat ini,
-    // (2) kedaluwarsa 7 hari sejak login online terakhir, (3) dicabut otomatis kalau
-    // server menyatakan password/akun tidak valid, (4) dikunci 60 detik setelah 5x salah.
+    // LOGIN OFFLINE: tablet menyimpan "sidik jari" password (PBKDF2 + salt acak, BUKAN
+    // password aslinya) di penyimpanan lokal. Kalau internet mati, password yang diketik
+    // dicocokkan ke sidik jari itu. Sidik jari bisa berasal dari dua jalur:
+    //  (1) pegawai login SAAT ONLINE di tablet ini (skema 'plain'), atau
+    //  (2) Owner menekan "Siapkan Login Offline" (skema 'sha256'): server mengirim hash
+    //      password pegawai outlet, tablet langsung membungkusnya dengan PBKDF2 lalu
+    //      membuang hash aslinya. Dengan jalur ini pegawai bisa login offline walau
+    //      belum pernah login di tablet ini.
+    // Pengaman: kedaluwarsa 30 hari sejak disimpan; dicabut otomatis kalau server
+    // menyatakan akun/password tidak valid; dikunci 60 detik setelah 5x salah; penyiapan
+    // ulang oleh Owner menghapus akun pegawai yang sudah tidak ada di server.
     // ==========================================
-    const OFFLINE_LOGIN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+    const OFFLINE_LOGIN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
     const OFFLINE_LOGIN_ITERATIONS = 150000;
     const OFFLINE_LOGIN_MAX_FAILS = 5;
     const OFFLINE_LOGIN_LOCK_MS = 60 * 1000;
     const OFFLINE_LOGIN_FAIL_KEY = 'qasir_offline_login_fail';
+    const OFFLINE_AUTH_INDEX_KEY = 'auth-index'; // daftar username yang punya catatan login offline
 
     function offlineLoginAvailable() {
       return typeof crypto !== 'undefined' && !!crypto.subtle && typeof TextEncoder !== 'undefined';
@@ -1563,26 +1568,107 @@
       return arr;
     }
 
-    async function derivePasswordHash(password, saltBytes, iterations) {
-      const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+    // Server membandingkan password setelah di-trim; tablet harus memperlakukannya sama.
+    function normalizePassword(password) {
+      return String(password == null ? '' : password).trim();
+    }
+
+    // SHA-256 heksadesimal huruf kecil dari teks UTF-8: SAMA PERSIS dengan hashPassword di Kode.gs.
+    async function sha256Hex(text) {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function derivePasswordHash(secret, saltBytes, iterations) {
+      const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveBits']);
       const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: saltBytes, iterations: iterations, hash: 'SHA-256' }, keyMaterial, 256);
       return new Uint8Array(bits);
     }
 
+    async function offlineAuthIndexGet() {
+      const idx = await offlineCacheGet(OFFLINE_AUTH_INDEX_KEY);
+      return Array.isArray(idx) ? idx : [];
+    }
+    async function offlineAuthIndexAdd(username) {
+      const idx = await offlineAuthIndexGet();
+      if (idx.indexOf(username) === -1) { idx.push(username); await offlineCacheSet(OFFLINE_AUTH_INDEX_KEY, idx); }
+    }
+    async function offlineAuthIndexRemove(username) {
+      const idx = await offlineAuthIndexGet();
+      const next = idx.filter(u => u !== username);
+      if (next.length !== idx.length) await offlineCacheSet(OFFLINE_AUTH_INDEX_KEY, next);
+    }
+
+    // secret = teks yang di-PBKDF2: password yang diketik (skema 'plain') atau hash SHA-256
+    // password dari server (skema 'sha256').
+    async function writeOfflineAuthRecord(username, secret, user, scheme) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const hash = await derivePasswordHash(secret, salt, OFFLINE_LOGIN_ITERATIONS);
+      await offlineCacheSet('auth:' + username, {
+        salt: bytesToBase64(salt), hash: bytesToBase64(hash),
+        iterations: OFFLINE_LOGIN_ITERATIONS, user: user, savedAt: Date.now(), scheme: scheme
+      });
+      await offlineAuthIndexAdd(username);
+    }
+
+    // Jalur (1): dipanggil setelah login online berhasil.
     async function saveOfflineLogin(username, password, user) {
       if (!offlineLoginAvailable()) return;
       try {
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const hash = await derivePasswordHash(password, salt, OFFLINE_LOGIN_ITERATIONS);
-        await offlineCacheSet('auth:' + username, {
-          salt: bytesToBase64(salt), hash: bytesToBase64(hash),
-          iterations: OFFLINE_LOGIN_ITERATIONS, user: user, savedAt: Date.now()
-        });
+        await writeOfflineAuthRecord(username, normalizePassword(password), user, 'plain');
       } catch (e) { /* gagal menyimpan bukan masalah fatal: login offline saja yang tidak tersedia */ }
     }
 
-    function clearOfflineLogin(username) {
-      return offlineCacheSet('auth:' + username, null);
+    async function clearOfflineLogin(username) {
+      await offlineCacheSet('auth:' + username, null);
+      await offlineAuthIndexRemove(username);
+    }
+
+    // Jalur (2): dipanggil setelah server menjawab permintaan Owner.
+    // accounts = [{ username, name, role, branchId, passwordHash }]
+    // Hasil: { added, removed, names }. Akun pegawai di outlet ini yang tersimpan di
+    // tablet tapi sudah tidak ada di daftar server ikut dihapus (misal pegawai berhenti).
+    async function provisionOfflineLogin(accounts, branchId) {
+      if (!offlineLoginAvailable()) throw new Error('Browser ini tidak mendukung login offline.');
+      const keep = {};
+      const names = [];
+      for (const acc of accounts) {
+        const key = String(acc.username).trim().toLowerCase();
+        const serverHash = String(acc.passwordHash || '').trim().toLowerCase();
+        if (!key || !/^[0-9a-f]{64}$/.test(serverHash)) continue;
+        await writeOfflineAuthRecord(key, serverHash, { username: acc.username, role: acc.role, name: acc.name, branchId: acc.branchId || '' }, 'sha256');
+        keep[key] = true;
+        names.push(acc.name || acc.username);
+      }
+      let removed = 0;
+      for (const key of await offlineAuthIndexGet()) {
+        if (keep[key]) continue;
+        const rec = await offlineCacheGet('auth:' + key);
+        const u = rec && rec.user;
+        // Hanya akun yang memang ikut disiapkan (pegawai kasir). Owner, Administrator, dan
+        // Rekan Bisnis tidak ikut disiapkan, jadi tidak boleh ikut terhapus di sini.
+        const covered = u && u.role !== 'Owner' && u.role !== 'Administrator' && u.role !== 'Rekan Bisnis';
+        if (covered && (!u.branchId || u.branchId === branchId)) {
+          await clearOfflineLogin(key);
+          removed++;
+        }
+      }
+      return { added: names.length, removed: removed, names: names };
+    }
+
+    // Daftar akun yang bisa dipakai login offline di tablet ini (untuk ditampilkan ke Owner).
+    async function listOfflineLoginAccounts() {
+      const out = [];
+      for (const key of await offlineAuthIndexGet()) {
+        const rec = await offlineCacheGet('auth:' + key);
+        if (!rec || !rec.user) continue;
+        out.push({
+          username: key, name: rec.user.name || key, role: rec.user.role, branchId: rec.user.branchId || '',
+          validUntil: rec.savedAt + OFFLINE_LOGIN_MAX_AGE_MS,
+          expired: Date.now() - rec.savedAt > OFFLINE_LOGIN_MAX_AGE_MS
+        });
+      }
+      return out;
     }
 
     function offlineLoginThrottleGet() {
@@ -1605,7 +1691,9 @@
 
       let same = false;
       try {
-        const hash = await derivePasswordHash(password, base64ToBytes(rec.salt), rec.iterations);
+        const typed = normalizePassword(password);
+        const secret = rec.scheme === 'sha256' ? await sha256Hex(typed) : typed;
+        const hash = await derivePasswordHash(secret, base64ToBytes(rec.salt), rec.iterations);
         const expected = base64ToBytes(rec.hash);
         let diff = hash.length === expected.length ? 0 : 1;
         for (let i = 0; i < hash.length && i < expected.length; i++) diff |= hash[i] ^ expected[i];
@@ -1700,7 +1788,7 @@
               setError('Tidak ada koneksi internet, dan browser ini tidak mendukung login offline.');
             } else {
               // 'no-record' atau 'expired'
-              setError('Tidak ada koneksi internet. Login offline hanya bisa untuk akun yang sudah pernah login online di tablet ini dalam 7 hari terakhir.');
+              setError('Tidak ada koneksi internet. Login offline hanya bisa untuk akun yang pernah login online di tablet ini dalam 30 hari terakhir, atau yang sudah disiapkan Owner lewat menu Pemeliharaan Data.');
             }
           }
         }
@@ -2122,7 +2210,7 @@
               {keepAlive('absensi', <AttendanceHistoryView branch={branch} allowBranchFilter={true} settings={settings} />)}
               {keepAlive('rekap-shift', <ShiftRecapView branch={branch} allowBranchFilter={true} settings={settings} />)}
               {keepAlive('cabang', <BranchManagerView />)}
-              {keepAlive('pemeliharaan', <DataMaintenanceView />)}
+              {keepAlive('pemeliharaan', <DataMaintenanceView user={user} branch={branch} />)}
               {keepAlive('inventory-ringkasan', <InventoryOverviewView branch={branch} />)}
               {keepAlive('inventory-barang-masuk', <BarangMasukView user={user} branch={branch} />)}
               {keepAlive('inventory-catat', <StockMovementFormView user={user} branch={branch} />)}
@@ -2910,7 +2998,115 @@
     // ==========================================
     // PEMELIHARAAN DATA (Arsip Transaksi Lama & Backup Spreadsheet)
     // ==========================================
-    function DataMaintenanceView() {
+    // ==========================================
+    // KARTU "LOGIN OFFLINE UNTUK PEGAWAI" (khusus Owner, di menu Pemeliharaan Data).
+    // Owner menyiapkan tablet ini SATU KALI saat online; sesudahnya pegawai outlet bisa
+    // login di tablet ini walau tidak ada internet, termasuk yang belum pernah login di sini.
+    // ==========================================
+    function OfflineLoginSetupCard({ user, branch }) {
+      const [branches, setBranches] = useState([]);
+      const [branchId, setBranchId] = useState(branch && branch.ID && branch.ID !== 'ALL' ? branch.ID : '');
+      const [password, setPassword] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [message, setMessage] = useState(null); // { type: 'ok' | 'warn' | 'error', text }
+      const [accounts, setAccounts] = useState([]);
+      const supported = offlineLoginAvailable();
+
+      const refreshAccounts = () => { listOfflineLoginAccounts().then(setAccounts).catch(() => {}); };
+
+      useEffect(() => {
+        refreshAccounts();
+        runGoogleScript('getBranches').then(d => {
+          setBranches(d || []);
+          setBranchId(prev => prev || (d && d.length > 0 ? d[0].ID : ''));
+        }).catch(() => {});
+      }, []);
+
+      const fmtDate = (ts) => new Date(ts).toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
+
+      const handleSetup = async (e) => {
+        e.preventDefault();
+        if (!password || !branchId) return;
+        setBusy(true);
+        setMessage(null);
+        try {
+          const res = await runGoogleScript('getOfflineLoginMaterial', user.username, password, branchId);
+          if (!res || !res.success) {
+            setMessage({ type: 'error', text: (res && res.message) || 'Gagal menyiapkan login offline.' });
+          } else {
+            const out = await provisionOfflineLogin(res.accounts || [], branchId);
+            if (out.added === 0) {
+              setMessage({ type: 'warn', text: 'Tidak ada akun pegawai untuk outlet ini.' + (out.removed > 0 ? ' ' + out.removed + ' akun lama dihapus dari tablet ini.' : '') });
+            } else {
+              setMessage({ type: 'ok', text: out.added + ' akun pegawai siap login offline di tablet ini (' + out.names.join(', ') + '). Berlaku 30 hari.' + (out.removed > 0 ? ' ' + out.removed + ' akun lama yang sudah tidak terdaftar dihapus dari tablet ini.' : '') });
+            }
+            setPassword('');
+          }
+        } catch (err) {
+          setMessage({ type: 'error', text: (err && err.serverError) ? 'Server menolak permintaan: ' + err.message : 'Tidak ada koneksi internet. Penyiapan hanya bisa dilakukan saat tablet online.' });
+        }
+        refreshAccounts();
+        setBusy(false);
+      };
+
+      return (
+        <div className="bg-white rounded-2xl shadow-sm border p-6 mb-6">
+          <div className="flex items-start justify-between mb-3 gap-3">
+            <div>
+              <h3 className="font-bold text-gray-800">Login Offline untuk Pegawai</h3>
+              <p className="text-gray-500 text-xs mt-1 leading-relaxed">Siapkan tablet ini supaya pegawai outlet bisa login walau tidak ada internet, termasuk yang belum pernah login di tablet ini. Lakukan sekali saat tablet online; berlaku 30 hari. Ulangi kalau ada pegawai baru, password diganti, atau pegawai berhenti.</p>
+            </div>
+            <div className="w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 bg-indigo-50">
+              <i className="fa-solid fa-user-lock text-xl text-indigo-500"></i>
+            </div>
+          </div>
+
+          {!supported ? (
+            <p className="text-amber-600 text-sm font-semibold"><i className="fa-solid fa-triangle-exclamation mr-1.5"></i>Browser ini tidak mendukung login offline.</p>
+          ) : (
+            <form onSubmit={handleSetup} className="space-y-3">
+              {branches.length > 1 && (
+                <div>
+                  <label className="block text-xs font-bold text-gray-600 mb-1">Outlet</label>
+                  <select value={branchId} onChange={e => setBranchId(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-indigo-500 outline-none">
+                    {branches.map(b => <option key={b.ID} value={b.ID}>{b.Name}</option>)}
+                  </select>
+                </div>
+              )}
+              <div>
+                <label className="block text-xs font-bold text-gray-600 mb-1">Password Owner (untuk konfirmasi)</label>
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Ketik ulang password Anda" />
+              </div>
+              <button type="submit" disabled={busy || !password || !branchId} className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-5 py-2.5 rounded-xl text-sm font-bold transition-colors">
+                {busy ? <i className="fa-solid fa-spinner fa-spin"></i> : <span><i className="fa-solid fa-user-lock mr-1.5"></i>Siapkan Login Offline</span>}
+              </button>
+            </form>
+          )}
+
+          {message && (
+            <div className={`mt-3 text-sm font-semibold px-3 py-2 rounded-lg ${message.type === 'ok' ? 'bg-emerald-50 text-emerald-700' : message.type === 'warn' ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-600'}`}>{message.text}</div>
+          )}
+
+          <div className="mt-4 pt-4 border-t">
+            <p className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Akun yang bisa login offline di tablet ini</p>
+            {accounts.length === 0 ? (
+              <p className="text-sm text-gray-400">Belum ada.</p>
+            ) : (
+              <div className="space-y-1.5">
+                {accounts.map(a => (
+                  <div key={a.username} className="flex items-center justify-between text-sm bg-slate-50 rounded-lg px-3 py-2 gap-3">
+                    <span className="font-semibold text-gray-700 truncate">{a.name} <span className="text-gray-400 font-normal">({a.username}) · {a.role}</span></span>
+                    <span className={`text-xs font-bold flex-shrink-0 ${a.expired ? 'text-red-500' : 'text-gray-400'}`}>{a.expired ? 'Kedaluwarsa' : 'sampai ' + fmtDate(a.validUntil)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function DataMaintenanceView({ user, branch }) {
       const [status, setStatus] = useState({ archiveEnabled: false, backupEnabled: false, totalTransactionRows: 0, totalStockMovementRows: 0, totalAttendanceRows: 0, estimatedTotalCells: 0, archiveUrl: '', archiveMonths: 3 });
       const [loading, setLoading] = useState(true);
       const [archiving, setArchiving] = useState(false);
@@ -3029,6 +3225,9 @@
             <h2 className="text-2xl font-bold text-gray-800">Pemeliharaan Data</h2>
             <p className="text-gray-500 text-sm mt-1">Jaga aplikasi tetap cepat & data tetap aman untuk jangka panjang.</p>
           </div>
+
+          {/* LOGIN OFFLINE UNTUK PEGAWAI */}
+          <OfflineLoginSetupCard user={user} branch={branch} />
 
           {/* KAPASITAS PENYIMPANAN */}
           <div className="bg-white rounded-2xl shadow-sm border p-6 mb-6">
