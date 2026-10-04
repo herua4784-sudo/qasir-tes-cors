@@ -160,6 +160,31 @@
     // ==========================================
     const OFFLINE_QUEUEABLE_FUNCTIONS = ['saveTransaction', 'recordAttendance', 'recordStockMovement'];
 
+    // ==========================================
+    // KUNCI ANTI-GANDA: tiap permintaan tulis diberi "kunci unik" SEKALI saat pertama
+    // dibuat, lalu kunci yang sama dipakai di SEMUA percobaan kirim (langsung maupun
+    // dari antrian). Server mengenali kunci itu: kalau permintaan sudah pernah
+    // tersimpan (misal internet putus tepat sebelum balasan sampai), kiriman ulang
+    // tidak ditulis dua kali. Kunci diletakkan sebagai argumen TERAKHIR; jumlah
+    // argumen baku tiap fungsi dicatat di bawah supaya posisinya selalu tepat.
+    // ==========================================
+    const QUEUEABLE_ARITY = { saveTransaction: 9, recordAttendance: 4, recordStockMovement: 8 };
+
+    function newRequestId() {
+      try { if (crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) { /* lanjut ke cara cadangan */ }
+      return 'R' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 8);
+    }
+
+    // Tambahkan kunci kalau belum ada (aman dipanggil berulang: yang sudah punya kunci tidak diubah).
+    function withRequestId(functionName, args) {
+      const arity = QUEUEABLE_ARITY[functionName];
+      if (arity === undefined || args.length > arity) return args;
+      const padded = args.slice();
+      while (padded.length < arity) padded.push(''); // argumen opsional yang tidak diisi pemanggil
+      padded.push(newRequestId());
+      return padded;
+    }
+
     function queueAddWrite(payload) {
       return openOfflineDb().then(db => new Promise((resolve, reject) => {
         const tx = db.transaction(QUEUE_STORE_NAME, 'readwrite');
@@ -235,6 +260,13 @@
       for (const item of pending) {
         if (item.failed) continue;
         try {
+          // Item dari versi lama (belum punya kunci): beri kunci SEKARANG dan simpan
+          // sebelum dikirim, supaya percobaan ulang sesudahnya sudah terlindungi.
+          const keyedArgs = withRequestId(item.functionName, item.args);
+          if (keyedArgs !== item.args) {
+            item.args = keyedArgs;
+            await queueUpdateWrite(item);
+          }
           let trxId = item.savedTrxId;
           if (!(item.functionName === 'saveTransaction' && trxId)) {
             const res = await runGoogleScriptRaw(item.functionName, ...item.args);
@@ -251,7 +283,9 @@
           }
           if (item.functionName === 'saveTransaction') {
             try {
-              await runGoogleScriptRaw('deductStockForSale', item.args[4], trxId, item.args[8]);
+              // Kunci potong stok diturunkan dari kunci transaksi (BUKAN dari ID transaksi,
+              // yang tidak unik), jadi kalau diulang tidak memotong stok dua kali.
+              await runGoogleScriptRaw('deductStockForSale', item.args[4], trxId, item.args[8], 'D-' + item.args[9]);
             } catch (deductErr) {
               // Sama seperti alur online: gagal potong stok karena server (misal resep
               // bermasalah) hanya dicatat, tidak menggagalkan transaksinya. Kalau
@@ -483,12 +517,15 @@
       // simpan ke antrian lokal dan kembalikan hasil "seolah berhasil" supaya alur
       // aplikasi (cetak struk, dst) tetap berjalan seperti biasa.
       if (OFFLINE_QUEUEABLE_FUNCTIONS.indexOf(functionName) !== -1) {
-        return runGoogleScriptRaw(functionName, ...args).then((res) => {
+        // Kunci dibuat SEKALI di sini; kalau percobaan pertama gagal dan masuk antrian,
+        // kunci yang sama ikut tersimpan dan dipakai lagi saat dikirim ulang.
+        const keyedArgs = withRequestId(functionName, args);
+        return runGoogleScriptRaw(functionName, ...keyedArgs).then((res) => {
           if (res && res.success !== false) markReadsDirty(functionName);
           return res;
         }).catch((err) => {
           const optimistic = buildOptimisticResult(functionName);
-          return queueAddWrite({ functionName, args, optimistic, createdAt: Date.now() }).then(() => {
+          return queueAddWrite({ functionName, args: keyedArgs, optimistic, createdAt: Date.now() }).then(() => {
             console.warn('[Offline] ' + functionName + ' disimpan ke antrian lokal, akan otomatis dikirim begitu online.');
             return Object.assign({}, optimistic, { offlineQueued: true });
           });
@@ -7564,9 +7601,14 @@
             // Pengurangan stok bahan baku dijalankan di LATAR BELAKANG, sengaja TIDAK
             // ditunggu (tanpa "await"), supaya kasir bisa langsung lanjut ke pembeli
             // berikutnya tanpa perlu menunggu proses ini selesai.
-            runGoogleScript('deductStockForSale', cart, res.trxId, branch ? branch.ID : 'BR001').catch(() => {
-              console.warn('Pengurangan stok otomatis gagal di latar belakang untuk transaksi ' + res.trxId);
-            });
+            // KECUALI transaksinya baru masuk antrian offline: ID-nya masih sementara dan
+            // pengurangan stoknya akan dikirim otomatis (dengan ID asli) saat sinkron.
+            // Kalau tetap dikirim sekarang, stok bisa terpotong dua kali.
+            if (!res.offlineQueued) {
+              runGoogleScript('deductStockForSale', cart, res.trxId, branch ? branch.ID : 'BR001').catch(() => {
+                console.warn('Pengurangan stok otomatis gagal di latar belakang untuk transaksi ' + res.trxId);
+              });
+            }
             setCart([]);
             setPaymentModal(false);
             setSuccessModalOpen(true);
